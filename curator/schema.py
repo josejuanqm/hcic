@@ -250,7 +250,8 @@ def surface(
         (SURFACE_RECENCY_THRESHOLD, SURFACE_CONFIDENCE_THRESHOLD, limit)
     ).fetchall()
 
-    # Apply lazy decay at read time
+    # Apply lazy decay at read time, then re-sort by computed recency
+    # (SQL sorted by stored recency; computed recency may differ in order)
     conceptions = []
     for row in rows:
         current_recency = _compute_current_recency(
@@ -266,6 +267,7 @@ def surface(
                 source=row["source"]
             ))
 
+    conceptions.sort(key=lambda c: (c.recency, c.confidence), reverse=True)
     return conceptions
 
 
