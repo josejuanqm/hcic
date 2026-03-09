@@ -27,7 +27,7 @@ EXPLICIT_INSTRUCTION_MAGNITUDE = 1.0  # user correction = max contradiction
 SEMANTIC_MATCH_THRESHOLD = 0.82 # cosine similarity to consider same conception
 SURFACE_RECENCY_THRESHOLD = 0.15
 SURFACE_CONFIDENCE_THRESHOLD = 0.05
-EMBEDDING_DIM = 1024            # claude embeddings dimension
+EMBEDDING_DIM = 384             # all-MiniLM-L6-v2 dimension
 
 
 # --- Data structures ---
@@ -83,7 +83,7 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE VIRTUAL TABLE IF NOT EXISTS conception_embeddings
         USING vec0(
             conception_id INTEGER PRIMARY KEY,
-            embedding FLOAT[1024]
+            embedding FLOAT[384]
         );
 
         -- Observation log — raw inputs before they become conceptions
@@ -107,6 +107,15 @@ def _init_schema(conn: sqlite3.Connection):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at)")
+
+    # Episode embeddings — separate virtual table for vector recall
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS episode_embeddings
+        USING vec0(
+            episode_id INTEGER PRIMARY KEY,
+            embedding FLOAT[384]
+        )
+    """)
     conn.commit()
 
 
@@ -295,6 +304,58 @@ def log_observation(
         (content, signal_quality, time.time(), json.dumps(affected_conceptions))
     )
     conn.commit()
+
+
+def log_episode(
+    conn: sqlite3.Connection,
+    session_id: str,
+    user_input: str,
+    assistant_summary: str,
+    embedding: list[float]
+) -> int:
+    """Insert episode and its embedding. Returns episode id."""
+    cur = conn.execute(
+        "INSERT INTO episodes (session_id, user_input, assistant_summary) VALUES (?, ?, ?)",
+        (session_id, user_input, assistant_summary)
+    )
+    episode_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO episode_embeddings (episode_id, embedding) VALUES (?, ?)",
+        (episode_id, json.dumps(embedding))
+    )
+    conn.commit()
+    return episode_id
+
+
+def find_related_episodes(
+    conn: sqlite3.Connection,
+    embedding: list[float],
+    limit: int = 10
+) -> list[dict]:
+    """Vector search over episode store. Returns episodes ordered by similarity."""
+    rows = conn.execute(
+        """SELECT e.id, e.session_id, e.user_input, e.assistant_summary, e.created_at,
+                  ee.distance
+           FROM episode_embeddings ee
+           JOIN episodes e ON e.id = ee.episode_id
+           WHERE ee.embedding MATCH ?
+             AND k = ?
+           ORDER BY ee.distance""",
+        (json.dumps(embedding), limit)
+    ).fetchall()
+
+    results = []
+    for row in rows:
+        similarity = max(0.0, 1.0 - (row[5] / 2.0))  # L2 distance → similarity
+        results.append({
+            "id": row[0],
+            "session_id": row[1],
+            "user_input": row[2],
+            "assistant_summary": row[3],
+            "created_at": row[4],
+            "similarity": similarity
+        })
+    return results
 
 
 if __name__ == "__main__":

@@ -42,21 +42,37 @@ client = anthropic.Anthropic(api_key=_api_key) if _api_key else None
 
 # --- Embedding ---
 
+_embedding_model = None
+
+def _get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedding_model
+
 def embed(text: str) -> list[float]:
-    """Get embedding. Uses mock when no API key available."""
-    return _mock_embed(text)  # real embedding API TBD
+    """
+    Real embeddings via sentence-transformers all-MiniLM-L6-v2.
+    384-dim, runs locally, no API key needed.
+    Falls back to mock if CURATOR_MOCK=true.
+    """
+    if MOCK_MODE:
+        return _mock_embed(text)
+    model = _get_embedding_model()
+    vec = model.encode(text, normalize_embeddings=True)
+    return vec.tolist()
 
 
 def _mock_embed(text: str) -> list[float]:
     """
     Mock embedding using character-level features.
-    Produces 1024-dim normalized vector.
-    Words that share characters will have some similarity — enough to test the pipeline.
-    Replace with real embedding API in production.
+    Produces 384-dim normalized vector (matches real model dim).
+    Only used when CURATOR_MOCK=true.
     """
     seed = int(hashlib.md5(text.lower().encode()).hexdigest(), 16)
     vec = []
-    for i in range(1024):
+    for i in range(384):
         seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
         vec.append((seed / 0xFFFFFFFF) * 2 - 1)
     magnitude = math.sqrt(sum(x * x for x in vec))

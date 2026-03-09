@@ -35,9 +35,10 @@ from schema import (
     connect, surface as surface_fn, SignalQuality,
     create_conception, update_weight, find_related_conceptions,
     get_conception, _compute_current_recency,
+    log_episode, find_related_episodes,
     INITIAL_CONFIDENCE
 )
-from observe import embed  # mock embed, no API call
+from observe import embed
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -235,11 +236,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         if not user_input:
             return [types.TextContent(type="text", text="Error: user_input required")]
 
-        conn.execute(
-            "INSERT INTO episodes (session_id, user_input, assistant_summary) VALUES (?, ?, ?)",
-            (session_id, user_input, assistant_summary)
-        )
-        conn.commit()
+        # Embed the combined text for vector recall
+        combined = f"{user_input} {assistant_summary}".strip()
+        embedding = embed(combined)
+
+        log_episode(conn, session_id, user_input, assistant_summary, embedding)
         return [types.TextContent(type="text", text="Episode logged.")]
 
     elif name == "recall":
@@ -249,31 +250,22 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         if not query:
             return [types.TextContent(type="text", text="Error: query required")]
 
-        words = query.lower().split()
-        conditions = " AND ".join(
-            "(LOWER(user_input) LIKE ? OR LOWER(assistant_summary) LIKE ?)"
-            for _ in words
-        )
-        params = []
-        for w in words:
-            params.extend([f"%{w}%", f"%{w}%"])
-        params.append(limit)
+        embedding = embed(query)
+        episodes = find_related_episodes(conn, embedding, limit=limit)
 
-        rows = conn.execute(
-            f"SELECT session_id, user_input, assistant_summary, created_at "
-            f"FROM episodes WHERE {conditions} ORDER BY created_at DESC LIMIT ?",
-            params
-        ).fetchall()
+        if not episodes:
+            total = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+            return [types.TextContent(type="text", text=
+                f"No related episodes found. Total logged: {total}"
+            )]
 
-        if not rows:
-            return [types.TextContent(type="text", text=f"No episodes found for: '{query}'")]
-
-        lines = [f"Episodes matching '{query}':\n"]
-        for row in rows:
+        lines = [f"Episodes related to: '{query[:60]}'\n"]
+        for ep in episodes:
             lines.append(
-                f"[{row[3][:16]}] session:{row[0][:20]}\n"
-                f"  User: {row[1][:100]}\n"
-                f"  {row[2][:120] if row[2] else '(no summary)'}"
+                f"[{ep['created_at'][:16]}] session:{ep['session_id'][:20]} "
+                f"(similarity: {ep['similarity']:.2f})\n"
+                f"  User: {ep['user_input'][:100]}\n"
+                f"  {ep['assistant_summary'][:120] if ep['assistant_summary'] else '(no summary)'}"
             )
         return [types.TextContent(type="text", text="\n\n".join(lines))]
 
