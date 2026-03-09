@@ -75,7 +75,7 @@ def evaluate_signal_quality(text: str) -> SignalQuality:
         return _mock_signal_quality(text)
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",
         max_tokens=200,
         system="""You evaluate the clarity and specificity of user input for a memory system.
 
@@ -122,7 +122,7 @@ def classify_signal(existing_content: str, new_observation: str) -> dict:
         return _mock_classify(existing_content, new_observation)
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",
         max_tokens=300,
         system="""You classify the relationship between an existing belief and a new observation.
 
@@ -198,7 +198,7 @@ def extract_conceptions(text: str, signal_quality: SignalQuality) -> list[str]:
         return _mock_extract(text, signal_quality)
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",
         max_tokens=500,
         system=f"""Extract atomic conceptions from user input for a personal context system.
 
