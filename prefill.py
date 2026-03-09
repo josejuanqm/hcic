@@ -307,6 +307,11 @@ if __name__ == "__main__":
         metavar="FILE"
     )
     parser.add_argument(
+        "--reset", "-r",
+        help="Clear all conceptions before prefilling (ignored in dry-run)",
+        action="store_true"
+    )
+    parser.add_argument(
         "--project", "-p",
         help="Filter by project name (partial match)",
         default=None
@@ -330,6 +335,17 @@ if __name__ == "__main__":
         print(f"{DIM}export ANTHROPIC_API_KEY=your_key_here{RESET}")
         print(f"{DIM}Or use --dry-run to preview without storing{RESET}")
         sys.exit(1)
+
+    if args.reset and not args.dry_run:
+        conn = connect(DB_PATH)
+        conn.execute("DELETE FROM conceptions")
+        conn.execute("DELETE FROM observations")
+        try:
+            conn.execute("DELETE FROM conception_embeddings")
+        except Exception:
+            pass
+        conn.commit()
+        print(f"{YELLOW}Conception space cleared.{RESET}\n")
 
     if args.claudeai:
         prefill_claudeai(
