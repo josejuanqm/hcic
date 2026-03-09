@@ -1,24 +1,28 @@
 """
-Curator — MCP Server
-Exposes the Weight engine as tools Claude Code can call.
+Curator — MCP Server (no API calls)
+Pure Weight engine. Claude Code is the intelligence layer.
+
+Claude Code handles: signal quality, extraction, classification.
+This server handles: weight math, decay, persistence, surface.
 
 Tools:
-  observe(text)  — process input, update conception space
-  surface()      — return currently relevant conceptions as context
-  inspect()      — dump full conception space for debugging
+  create_conception(content, initial_confidence?)
+  update_weight(conception_id, delta)
+  find_related(content) -> list of similar conceptions
+  surface(signal_quality?, limit?) -> weighted conceptions
+  inspect() -> full conception space
 
-Setup in Claude Code (~/.claude/settings.json):
+Setup in ~/.claude/settings.json:
   {
     "mcpServers": {
       "curator": {
-        "command": "python3",
-        "args": ["/path/to/hcic/curator/mcp_server.py"],
-        "env": {
-          "ANTHROPIC_API_KEY": "your_key_here"
-        }
+        "command": "/path/to/hcic/.venv/bin/python3",
+        "args": ["/path/to/hcic/curator/mcp_server.py"]
       }
     }
   }
+
+No ANTHROPIC_API_KEY needed — Claude Code is already Claude.
 """
 
 import os
@@ -27,8 +31,13 @@ import json
 import asyncio
 
 sys.path.insert(0, os.path.dirname(__file__))
-from schema import connect, surface as surface_fn, SignalQuality, _compute_current_recency
-from observe import observe as observe_fn
+from schema import (
+    connect, surface as surface_fn, SignalQuality,
+    create_conception, update_weight, find_related_conceptions,
+    get_conception, _compute_current_recency,
+    INITIAL_CONFIDENCE
+)
+from observe import embed  # mock embed, no API call
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -36,11 +45,8 @@ from mcp import types
 
 # ─── DB ──────────────────────────────────────────────────────────────────────
 
-# Store DB next to this file so it persists between Claude Code sessions
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "curator_mcp.db")
 conn = connect(DB_PATH)
-
-# ─── Server ──────────────────────────────────────────────────────────────────
 
 server = Server("curator")
 
@@ -49,47 +55,84 @@ server = Server("curator")
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
-            name="observe",
-            description="""Process input and update the Curator's conception space.
-Call this when the user expresses a preference, corrects you, shares context about 
-their project, workflow, or working style. The Curator extracts atomic conceptions, 
-weights them by confidence and recency, and handles contradictions by creating 
-competing conceptions rather than overwriting. Call observe() before surface() 
-at the start of a session with any known context.""",
+            name="create_conception",
+            description="""Store a new conception in the weight engine.
+Call this when you've determined a new atomic fact should be added to the conception space.
+Start with low initial_confidence (default 0.1) unless this is an explicit user instruction
+(use 0.4 for direct corrections like 'no, actually...' or 'I prefer...').""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "text": {
+                    "content": {
                         "type": "string",
-                        "description": "The input to observe and process into conceptions"
+                        "description": "The conception as a self-contained statement. E.g. 'User prefers 2-space indentation'"
                     },
-                    "source": {
-                        "type": "string",
-                        "description": "Where this input came from (e.g. 'user', 'correction', 'file')",
-                        "default": "claude_code"
+                    "initial_confidence": {
+                        "type": "number",
+                        "description": "Starting confidence 0.0-1.0. Default 0.1. Use 0.4 for explicit user instructions.",
+                        "default": 0.1
                     }
                 },
-                "required": ["text"]
+                "required": ["content"]
+            }
+        ),
+        types.Tool(
+            name="update_weight",
+            description="""Update the weight of an existing conception.
+Call with a positive delta for confirming signal (same thing said again, consistent behavior).
+Call with a negative delta for contradicting signal (user said something different).
+On contradiction: call update_weight(existing_id, negative_delta) to weaken it,
+then create_conception() to add the competing conception alongside it.
+Do NOT delete the existing conception — contradictions coexist.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "conception_id": {
+                        "type": "integer",
+                        "description": "ID of the conception to update (from find_related or surface)"
+                    },
+                    "delta": {
+                        "type": "number",
+                        "description": "Confidence change. Confirming: +0.05 to +0.3. Contradicting: -0.05 to -0.5. Explicit correction: -0.8."
+                    }
+                },
+                "required": ["conception_id", "delta"]
+            }
+        ),
+        types.Tool(
+            name="find_related",
+            description="""Find conceptions semantically related to a piece of text.
+Call this before deciding whether to create a new conception or update an existing one.
+Returns conceptions above similarity threshold with their current weights.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Text to find related conceptions for"
+                    }
+                },
+                "required": ["content"]
             }
         ),
         types.Tool(
             name="surface",
-            description="""Return currently relevant conceptions from the Curator's conception space.
-Call this at the start of each session and before responding to complex requests.
-Returns conceptions ordered by recency first (governs the present), then confidence 
-(governs the persistent). Use the returned context naturally — do not announce the 
-memory system to the user.""",
+            description="""Return currently relevant conceptions ordered by recency then confidence.
+Call at the start of each session and before complex responses.
+Recency governs the present (high recency = recently active).
+Confidence governs persistence (high confidence = repeatedly confirmed).
+Use returned context naturally — do not announce the memory system.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "signal_quality": {
                         "type": "number",
-                        "description": "Clarity of current context, 0.0 to 1.0. Use 0.9 for session start, lower for ambiguous requests.",
+                        "description": "0.0-1.0. Use 0.9 for clear context, lower for ambiguous requests. Below 0.3 returns nothing.",
                         "default": 0.9
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max conceptions to surface",
+                        "description": "Max conceptions to return",
                         "default": 8
                     }
                 }
@@ -97,9 +140,7 @@ memory system to the user.""",
         ),
         types.Tool(
             name="inspect",
-            description="""Show the full conception space for debugging.
-Returns all conceptions with their recency and confidence values.
-Use when you want to understand what the Curator currently knows.""",
+            description="Show full conception space with all weights. Use for debugging or when user asks what you remember.",
             inputSchema={
                 "type": "object",
                 "properties": {}
@@ -111,35 +152,66 @@ Use when you want to understand what the Curator currently knows.""",
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
-    if name == "observe":
-        text = arguments.get("text", "").strip()
-        source = arguments.get("source", "claude_code")
+    if name == "create_conception":
+        content = arguments.get("content", "").strip()
+        initial_confidence = arguments.get("initial_confidence", INITIAL_CONFIDENCE)
 
-        if not text:
-            return [types.TextContent(type="text", text="Error: text is required")]
+        if not content:
+            return [types.TextContent(type="text", text="Error: content required")]
 
-        result = observe_fn(conn, text, source=source)
-        sq = result["signal_quality"]
+        embedding = embed(content)
+        cid = create_conception(conn, content, embedding, "claude_code", initial_confidence)
+        c = get_conception(conn, cid)
 
-        summary_parts = [
-            f"signal_quality: {sq['score']:.2f} ({sq['reason']})",
-            f"extracted: {len(result['conceptions_extracted'])} conception(s)"
-        ]
+        return [types.TextContent(type="text", text=
+            f"Created conception #{cid}\n"
+            f"recency: {c.recency:.2f} | confidence: {c.confidence:.2f}\n"
+            f"content: {content}"
+        )]
 
-        for action in result["actions"]:
-            a = action["action"]
-            if a == "created":
-                summary_parts.append(f"created conception #{action['id']}")
-            elif a == "confirmed":
-                summary_parts.append(f"confirmed #{action['id']} (confidence +{action['delta']:.2f})")
-            elif a == "competing_conception_created":
-                explicit = " [explicit correction]" if action.get("explicit_instruction") else ""
-                summary_parts.append(
-                    f"contradiction: weakened #{action['existing_id']}, "
-                    f"created competing #{action['new_id']}{explicit}"
+    elif name == "update_weight":
+        conception_id = arguments.get("conception_id")
+        delta = arguments.get("delta", 0)
+
+        if conception_id is None:
+            return [types.TextContent(type="text", text="Error: conception_id required")]
+
+        c_before = get_conception(conn, conception_id)
+        if not c_before:
+            return [types.TextContent(type="text", text=f"Error: conception #{conception_id} not found")]
+
+        update_weight(conn, conception_id, delta)
+        c_after = get_conception(conn, conception_id)
+
+        direction = "↑" if delta > 0 else "↓"
+        return [types.TextContent(type="text", text=
+            f"Updated #{conception_id} {direction}\n"
+            f"confidence: {c_before.confidence:.3f} → {c_after.confidence:.3f}\n"
+            f"recency reset: {c_after.recency:.2f}"
+        )]
+
+    elif name == "find_related":
+        content = arguments.get("content", "").strip()
+        if not content:
+            return [types.TextContent(type="text", text="Error: content required")]
+
+        embedding = embed(content)
+        related = find_related_conceptions(conn, embedding, limit=5)
+
+        if not related:
+            return [types.TextContent(type="text", text="No related conceptions found.")]
+
+        lines = [f"Related conceptions for: '{content[:60]}'\n"]
+        for cid, similarity in related:
+            c = get_conception(conn, cid)
+            if c:
+                lines.append(
+                    f"#{cid} (similarity: {similarity:.2f})\n"
+                    f"  recency: {c.recency:.2f} | confidence: {c.confidence:.2f}\n"
+                    f"  content: {c.content}"
                 )
 
-        return [types.TextContent(type="text", text="\n".join(summary_parts))]
+        return [types.TextContent(type="text", text="\n".join(lines))]
 
     elif name == "surface":
         signal_quality = arguments.get("signal_quality", 0.9)
@@ -149,18 +221,20 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         conceptions = surface_fn(conn, sq, limit=limit)
 
         if not conceptions:
-            return [types.TextContent(type="text", text="No conceptions above threshold yet.")]
+            total = conn.execute("SELECT COUNT(*) FROM conceptions").fetchone()[0]
+            return [types.TextContent(type="text", text=
+                f"No conceptions above threshold. Total in space: {total}"
+            )]
 
-        lines = ["Active context from conception space:\n"]
+        lines = ["Active context:\n"]
         for i, c in enumerate(conceptions, 1):
             lines.append(
-                f"{i}. {c.content}\n"
+                f"{i}. [{c.id}] {c.content}\n"
                 f"   recency: {c.recency:.2f} | confidence: {c.confidence:.2f}"
             )
 
         total = conn.execute("SELECT COUNT(*) FROM conceptions").fetchone()[0]
-        lines.append(f"\n({len(conceptions)} surfaced of {total} total conceptions)")
-
+        lines.append(f"\n{len(conceptions)} surfaced of {total} total")
         return [types.TextContent(type="text", text="\n".join(lines))]
 
     elif name == "inspect":
@@ -179,13 +253,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 f"#{row[0]} [{status}] rec={live_recency:.3f} conf={row[2]:.3f}\n"
                 f"  {row[3][:80]}"
             )
-
         return [types.TextContent(type="text", text="\n".join(lines))]
 
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
-
-# ─── Entry point ─────────────────────────────────────────────────────────────
 
 async def main():
     async with stdio_server() as (read_stream, write_stream):
