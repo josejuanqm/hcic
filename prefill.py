@@ -1,15 +1,23 @@
 """
-Curator — Prefill from Claude Code History
-Reads ~/.claude/projects/ JSONL files and seeds the conception space.
+Curator — Prefill from Conversation History
+Seeds the conception space from Claude Code history or a Claude.ai export.
 
 Usage:
-  python3 prefill.py                    # process all projects
-  python3 prefill.py --project myapp   # specific project
-  python3 prefill.py --limit 50        # last N conversations
-  python3 prefill.py --dry-run         # show what would be extracted, don't store
+  # Claude Code local history
+  python3 prefill.py                         # all projects
+  python3 prefill.py --project myapp        # specific project
+  python3 prefill.py --limit 50             # last N conversation files
 
-The script only processes user messages — not Claude's responses.
-You are what you said, not what Claude said back.
+  # Claude.ai export (conversations.json from Settings → Privacy → Export)
+  python3 prefill.py --claudeai conversations.json
+  python3 prefill.py --claudeai conversations.json --limit 20
+
+  # Preview without storing (works without API key)
+  python3 prefill.py --dry-run
+  python3 prefill.py --claudeai conversations.json --dry-run
+
+The script only processes your messages — not Claude's responses.
+You are what you said, not what was said back to you.
 """
 
 import os
@@ -53,6 +61,38 @@ def read_jsonl(path: str) -> list[dict]:
     except Exception:
         pass
     return messages
+
+
+def read_claudeai_export(path: str, limit: int = None) -> list[tuple[str, list[str]]]:
+    """
+    Read Claude.ai conversations.json export.
+    Returns list of (conversation_name, [user_message_texts]).
+    Sorted newest first.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Sort by updated_at, newest first
+    data.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
+
+    if limit:
+        data = data[:limit]
+
+    result = []
+    for convo in data:
+        name = convo.get("name", "unknown")
+        messages = convo.get("chat_messages", [])
+        texts = []
+        for msg in messages:
+            if msg.get("sender") != "human":
+                continue
+            text = msg.get("text", "").strip()
+            if text:
+                texts.append(text)
+        if texts:
+            result.append((name, texts))
+
+    return result
 
 
 def extract_user_messages(messages: list[dict]) -> list[str]:
@@ -105,6 +145,69 @@ def find_jsonl_files(project: str = None, limit: int = None) -> list[str]:
 
 
 # ─── Prefill ─────────────────────────────────────────────────────────────────
+
+def prefill_claudeai(export_path: str, limit: int = None, dry_run: bool = False):
+    """Prefill from a Claude.ai conversations.json export."""
+    conversations = read_claudeai_export(export_path, limit)
+
+    print(f"\n{BOLD}CURATOR — Prefill from Claude.ai Export{RESET}")
+    print(f"{DIM}Found {len(conversations)} conversation(s) with user messages{RESET}")
+    if dry_run:
+        print(f"{YELLOW}DRY RUN — nothing will be stored{RESET}")
+    print()
+
+    conn = None if dry_run else connect(DB_PATH)
+
+    total_messages = 0
+    total_conceptions = 0
+    skipped = 0
+
+    for i, (name, texts) in enumerate(conversations):
+        print(f"{DIM}[{i+1}/{len(conversations)}] {name[:60]} — {len(texts)} message(s){RESET}")
+
+        for text in texts:
+            if len(text.strip()) < 15:
+                skipped += 1
+                continue
+            if text.strip().startswith("/"):
+                skipped += 1
+                continue
+
+            total_messages += 1
+
+            if dry_run:
+                sq = evaluate_signal_quality(text)
+                if sq.score >= 0.5:
+                    print(f"  {GREEN}●{RESET} {DIM}[{sq.score:.2f}]{RESET} {text[:80]}")
+                else:
+                    print(f"  {DIM}○ [{sq.score:.2f}] {text[:80]}{RESET}")
+            else:
+                result = observe(conn, text, source=f"claudeai:{name[:30]}")
+                conceptions_created = sum(
+                    1 for a in result["actions"]
+                    if a["action"] in ("created", "competing_conception_created")
+                )
+                total_conceptions += conceptions_created
+                if conceptions_created > 0:
+                    sq = result["signal_quality"]
+                    print(f"  {GREEN}+{conceptions_created}{RESET} {DIM}[{sq['score']:.2f}] {text[:70]}{RESET}")
+
+            time.sleep(0.2)
+
+    print()
+    print(f"{BOLD}Done.{RESET}")
+    print(f"{DIM}Messages processed: {total_messages}{RESET}")
+    print(f"{DIM}Messages skipped: {skipped}{RESET}")
+
+    if not dry_run:
+        print(f"{DIM}Conceptions created: {total_conceptions}{RESET}")
+        surfaced = surface(conn, SignalQuality(score=0.9, reason="prefill"), limit=10)
+        if surfaced:
+            print(f"\n{BOLD}Top conceptions now in space:{RESET}")
+            for c in surfaced:
+                print(f"  {DIM}rec={c.recency:.2f} conf={c.confidence:.2f}{RESET} {c.content[:80]}")
+    print()
+
 
 def prefill(project: str = None, limit: int = None, dry_run: bool = False):
     files = find_jsonl_files(project, limit)
@@ -195,7 +298,13 @@ def prefill(project: str = None, limit: int = None, dry_run: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Prefill Curator conception space from Claude Code conversation history"
+        description="Prefill Curator conception space from conversation history"
+    )
+    parser.add_argument(
+        "--claudeai", "-c",
+        help="Path to Claude.ai conversations.json export",
+        default=None,
+        metavar="FILE"
     )
     parser.add_argument(
         "--project", "-p",
@@ -217,15 +326,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY") and not args.dry_run:
-        # Dry run works without key (just signal quality heuristics)
-        # Real run needs the key for extraction and classification
         print(f"\033[91mError: ANTHROPIC_API_KEY not set{RESET}")
         print(f"{DIM}export ANTHROPIC_API_KEY=your_key_here{RESET}")
         print(f"{DIM}Or use --dry-run to preview without storing{RESET}")
         sys.exit(1)
 
-    prefill(
-        project=args.project,
-        limit=args.limit,
-        dry_run=args.dry_run
-    )
+    if args.claudeai:
+        prefill_claudeai(
+            export_path=args.claudeai,
+            limit=args.limit,
+            dry_run=args.dry_run
+        )
+    else:
+        prefill(
+            project=args.project,
+            limit=args.limit,
+            dry_run=args.dry_run
+        )
