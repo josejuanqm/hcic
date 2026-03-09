@@ -4,3 +4,4 @@ __pycache__/
 .env
 *.docx
 .DS_Store
+.venv/
