@@ -139,7 +139,29 @@ Use returned context naturally — do not announce the memory system.""",
             }
         ),
         types.Tool(
-            name="inspect",
+            name="log_session",
+            description="""Store a summary of the current session before it ends.
+Call this when the user says goodbye, closes out, or when you sense the session is wrapping up.
+Also call proactively after any significant decision, solution, or milestone.
+
+Write a concise summary covering:
+- What was worked on (project, feature, problem)
+- Key decisions made
+- Solutions found or approaches tried
+- Anything the user should remember next session
+
+This creates a high-recency conception that will surface next session.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "What happened this session. 2-5 sentences, specific and concrete."
+                    }
+                },
+                "required": ["summary"]
+            }
+        ),
             description="Show full conception space with all weights. Use for debugging or when user asks what you remember.",
             inputSchema={
                 "type": "object",
@@ -236,6 +258,27 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         total = conn.execute("SELECT COUNT(*) FROM conceptions").fetchone()[0]
         lines.append(f"\n{len(conceptions)} surfaced of {total} total")
         return [types.TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "log_session":
+        summary = arguments.get("summary", "").strip()
+        if not summary:
+            return [types.TextContent(type="text", text="Error: summary required")]
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        content = f"[Session {timestamp}] {summary}"
+
+        embedding = embed(content)
+        # High recency start, low confidence — episodic not persistent
+        cid = create_conception(conn, content, embedding, "session_log",
+                                initial_confidence=0.15)
+        # Bump recency to max so it surfaces next session
+        conn.execute("UPDATE conceptions SET recency = 1.0 WHERE id = ?", (cid,))
+        conn.commit()
+
+        return [types.TextContent(type="text", text=
+            f"Session logged #{cid}\n{content[:120]}"
+        )]
 
     elif name == "inspect":
         rows = conn.execute(
