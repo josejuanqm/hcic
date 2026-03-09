@@ -233,6 +233,120 @@ def _mock_extract(text: str, signal_quality: SignalQuality) -> list[str]:
     return [f"User stated: {text.strip()}"]
 
 
+# --- Batch Prefill (fast path) ---
+
+def batch_evaluate_signal_quality(texts: list[str]) -> list[SignalQuality]:
+    """Evaluate signal quality for N messages in one API call."""
+    if MOCK_MODE or not client:
+        return [_mock_signal_quality(t) for t in texts]
+
+    numbered = "\n".join(f"{i+1}. {t[:300]}" for i, t in enumerate(texts))
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1000,
+        system="""You evaluate the clarity and specificity of multiple user inputs for a memory system.
+
+Return ONLY a JSON array with one object per input:
+[{"score": 0.0-1.0, "reason": "one sentence"}, ...]
+
+Score guide:
+- 0.0-0.2: vague, no-context ("yeah that", "ok", "hmm")
+- 0.3-0.5: short/ambiguous but has some content
+- 0.6-0.8: clear preference or fact
+- 0.9-1.0: explicit, specific, self-contained
+
+Return only the JSON array, no other text.""",
+        messages=[{"role": "user", "content": f"Evaluate these inputs:\n{numbered}"}]
+    )
+    try:
+        result = json.loads(response.content[0].text.strip())
+        return [SignalQuality(score=r["score"], reason=r["reason"]) for r in result]
+    except Exception:
+        return [SignalQuality(score=0.5, reason="batch eval failed") for _ in texts]
+
+
+def batch_extract_conceptions(texts: list[str], signal_qualities: list[SignalQuality]) -> list[list[str]]:
+    """Extract conceptions from N messages in one API call."""
+    if MOCK_MODE or not client:
+        return [_mock_extract(t, sq) for t, sq in zip(texts, signal_qualities)]
+
+    # Only include messages above threshold
+    items = []
+    for i, (text, sq) in enumerate(zip(texts, signal_qualities)):
+        if sq.score >= 0.3:
+            items.append(f"{i+1}. [score={sq.score:.2f}] {text[:300]}")
+
+    if not items:
+        return [[] for _ in texts]
+
+    numbered = "\n".join(items)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2000,
+        system="""Extract atomic conceptions from multiple user inputs for a personal context system.
+
+A conception is a single, standalone belief, preference, fact, or state about the person.
+- Phrase as third-person: "User prefers...", "User is working on...", "User uses..."
+- Each conception is self-contained and specific
+- Lower score → extract less (score < 0.5: max 1 conception; score >= 0.7: up to 3)
+- Skip inputs that contain no extractable facts
+
+Return ONLY a JSON object mapping input number to array of conception strings:
+{"1": ["conception a", "conception b"], "2": [], "3": ["conception c"]}
+
+Return only the JSON, no other text.""",
+        messages=[{"role": "user", "content": f"Extract from these inputs:\n{numbered}"}]
+    )
+    try:
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        result = json.loads(text)
+        return [result.get(str(i+1), []) for i in range(len(texts))]
+    except Exception:
+        return [[] for _ in texts]
+
+
+def batch_observe(conn, texts: list[str], source: str = "prefill", batch_size: int = 20) -> dict:
+    """
+    Fast-path observe for prefill. Skips per-conception classification.
+    All new conceptions created with low initial confidence — weight updates happen
+    through normal interactions after prefill.
+
+    Returns summary stats.
+    """
+    total_created = 0
+    total_skipped = 0
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+
+        # 1 call: signal quality for whole batch
+        signal_qualities = batch_evaluate_signal_quality(batch)
+
+        # 1 call: extract conceptions for whole batch
+        all_conceptions = batch_extract_conceptions(batch, signal_qualities)
+
+        # No classification — just store everything with low confidence
+        for text, sq, conceptions in zip(batch, signal_qualities, all_conceptions):
+            if not conceptions:
+                total_skipped += 1
+                continue
+            for conception_text in conceptions:
+                if not conception_text.strip():
+                    continue
+                embedding = embed(conception_text)
+                create_conception(conn, conception_text, embedding, source,
+                                  initial_confidence=INITIAL_CONFIDENCE)
+                total_created += 1
+
+        log_observation(conn, f"[batch:{len(batch)}]", 0.7, [])
+
+    return {"created": total_created, "skipped": total_skipped}
+
+
 # --- Core Observe Function ---
 
 def observe(conn, text: str, source: str = "conversation") -> dict:

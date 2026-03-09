@@ -29,7 +29,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "curator"))
 from schema import connect, surface, SignalQuality
-from observe import observe, evaluate_signal_quality
+from observe import observe, evaluate_signal_quality, batch_observe
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 
@@ -165,34 +165,29 @@ def prefill_claudeai(export_path: str, limit: int = None, dry_run: bool = False)
     for i, (name, texts) in enumerate(conversations):
         print(f"{DIM}[{i+1}/{len(conversations)}] {name[:60]} — {len(texts)} message(s){RESET}")
 
-        for text in texts:
-            if len(text.strip()) < 15:
-                skipped += 1
-                continue
-            if text.strip().startswith("/"):
-                skipped += 1
-                continue
+    for i, (name, texts) in enumerate(conversations):
+        # Filter before batching
+        clean = [t for t in texts if len(t.strip()) >= 15 and not t.strip().startswith("/")]
+        skipped += len(texts) - len(clean)
 
-            total_messages += 1
+        if not clean:
+            continue
 
-            if dry_run:
+        print(f"{DIM}[{i+1}/{len(conversations)}] {name[:60]} — {len(clean)} message(s){RESET}")
+
+        if dry_run:
+            for text in clean:
+                from observe import evaluate_signal_quality
                 sq = evaluate_signal_quality(text)
-                if sq.score >= 0.5:
-                    print(f"  {GREEN}●{RESET} {DIM}[{sq.score:.2f}]{RESET} {text[:80]}")
-                else:
-                    print(f"  {DIM}○ [{sq.score:.2f}] {text[:80]}{RESET}")
-            else:
-                result = observe(conn, text, source=f"claudeai:{name[:30]}")
-                conceptions_created = sum(
-                    1 for a in result["actions"]
-                    if a["action"] in ("created", "competing_conception_created")
-                )
-                total_conceptions += conceptions_created
-                if conceptions_created > 0:
-                    sq = result["signal_quality"]
-                    print(f"  {GREEN}+{conceptions_created}{RESET} {DIM}[{sq['score']:.2f}] {text[:70]}{RESET}")
-
-            time.sleep(0.2)
+                marker = f"{GREEN}●{RESET}" if sq.score >= 0.5 else f"{DIM}○{RESET}"
+                print(f"  {marker} {DIM}[{sq.score:.2f}]{RESET} {text[:80]}")
+        else:
+            result = batch_observe(conn, clean, source=f"claudeai:{name[:30]}")
+            total_conceptions += result["created"]
+            skipped += result["skipped"]
+            total_messages += len(clean)
+            if result["created"] > 0:
+                print(f"  {GREEN}+{result['created']} conceptions{RESET}")
 
     print()
     print(f"{BOLD}Done.{RESET}")
