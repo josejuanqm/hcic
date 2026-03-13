@@ -403,23 +403,20 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         # Rerank by semantic similarity to context if we have it
         if has_context and conceptions:
             context_embedding = embed(context_str)
+            # Use sqlite-vec MATCH — never read raw blob bytes
+            context_results = conn.execute(
+                """SELECT conception_id, distance
+                   FROM conception_embeddings
+                   WHERE embedding MATCH ?
+                   AND k = ?
+                   ORDER BY distance""",
+                (json.dumps(context_embedding), limit * 2)
+            ).fetchall()
+            context_scores = {row["conception_id"]: 1.0 / (1.0 + row["distance"]) for row in context_results}
+
             scored = []
             for c in conceptions:
-                # Get stored embedding for this conception
-                row = conn.execute(
-                    "SELECT embedding FROM conception_embeddings WHERE conception_id = ?",
-                    (c.id,)
-                ).fetchone()
-                if row:
-                    import json as _json
-                    stored = _json.loads(row[0])
-                    # Cosine similarity
-                    dot = sum(a * b for a, b in zip(context_embedding, stored))
-                    context_score = max(0.0, dot)
-                else:
-                    context_score = 0.0
-
-                # Blend: weight score (recency + confidence) + context relevance
+                context_score = context_scores.get(c.id, 0.0)
                 weight_score = (c.recency * 0.5) + (c.confidence * 0.5)
                 combined = (weight_score * 0.5) + (context_score * 0.5)
                 scored.append((combined, c))
@@ -431,9 +428,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
         # Recent episodes — reranked by context if available
         if has_context and opening_message:
-            # Use opening message to find semantically relevant episodes
             episode_embedding = embed(opening_message + " " + context_str)
-            from schema import find_related_episodes
             relevant_episodes = find_related_episodes(conn, episode_embedding, limit=episode_limit)
             if relevant_episodes:
                 lines.append("Relevant episodes:\n")
